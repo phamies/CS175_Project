@@ -89,6 +89,7 @@ class MalmoBoatEnv(gym.Env):
         self.last_raw_obs                  = None
         self.last_obs                      = np.zeros(14, dtype=np.float32)
         self.checkpoint_threshold          = 5.0
+        self.steps = 0
 
     # -------------------------------------------------------------------------
     # Public API
@@ -105,6 +106,7 @@ class MalmoBoatEnv(gym.Env):
         return self._quick_respawn()
 
     def step(self, action):
+        self.steps += 1
         self._send_action(action)
         throttle_idx = int(action[0])
 
@@ -123,7 +125,7 @@ class MalmoBoatEnv(gym.Env):
 
         world_state = self.agent_host.getWorldState()
         obs    = self._get_observation(world_state)
-        reward = self._compute_reward()
+        reward = self._compute_reward(action)
         done   = self._check_done(world_state)
 
         return obs, reward, done, {
@@ -228,8 +230,7 @@ class MalmoBoatEnv(gym.Env):
         time.sleep(TICK_LENGTH * 20)
 
         # Look Down
-        self.agent_host.sendCommand("moveMouse 400 -1000")
-        self.agent_host.sendCommand("setYaw 0")
+        self.agent_host.sendCommand("moveMouse 0 -1000")
         time.sleep(TICK_LENGTH * 5)
         # 3. Summon boat at spawn level
         self.agent_host.sendCommand(
@@ -279,9 +280,13 @@ class MalmoBoatEnv(gym.Env):
             return True
         return False
 
-    def _compute_reward(self):
+    def _compute_reward(self, action):
         if self.last_raw_obs is None:
             return 0.0
+        # Get steering index from your MultiDiscrete action [throttle, steering]
+        # 0: None, 1: Left, 2: Right
+
+        steering_idx = int(action[1])
 
         obs   = self.last_raw_obs
         x     = obs.get('XPos', 0)
@@ -341,12 +346,37 @@ class MalmoBoatEnv(gym.Env):
         # Penalize getting worse when already close to aligned.
         # Guard: only penalize if we were within 90 deg last step,
         # so the initial turn from a bad spawn heading is free.
-        if self.prev_abs_rel is not None and self.prev_abs_rel < math.pi / 2:
-            worse = abs_rel - self.prev_abs_rel
-            if worse > 0:
-                reward -= worse * 2.0
-        self.prev_abs_rel = abs_rel
+        # if self.prev_abs_rel is not None and self.prev_abs_rel < math.pi / 2:
+        #     worse = abs_rel - self.prev_abs_rel
+        #     if worse > 0:
+        #         reward -= worse * 2.0
+        # self.prev_abs_rel = abs_rel
 
+        # rel > 0 means target is to the RIGHT.
+        # rel < 0 means target is to the LEFT.
+
+        if rel > math.radians(20) and steering_idx == 2:
+            reward += 1.5  # Correcting toward the right
+        elif rel < math.radians(-20) and steering_idx == 1:
+            reward += 1.5  # Correcting toward the left
+
+        if self.prev_abs_rel is not None:
+            # If abs_rel is increasing, we are spinning AWAY from target
+            # If abs_rel is decreasing, we are rotating TOWARD target
+            rotation_direction = self.prev_abs_rel - abs_rel
+            if abs_rel < math.radians(15):
+                if steering_idx == 0:
+                    reward += 1.0 # Reward "hands off the wheel" when straight
+                else:
+                    # Check if this steering is helpful or harmful
+                    # If we are rotating TOWARD the center (rotation_direction > 0)
+                    # but we are still steering, that's oversteering.
+                    if rotation_direction > 0:
+                        reward -= 2.0 # STOP STEERING, you're already headed home!
+                    else:
+                        # This is a COUNTER-STEER. 
+                        # We are rotating away, so steering is necessary.
+                        reward += 1.5
         # --- Stage 2: forward progress only when aligned ---
         # Distance shaping and speed reward only fire when facing within 45 deg.
         # Agent must earn the right to go fast by aligning first.
@@ -360,15 +390,22 @@ class MalmoBoatEnv(gym.Env):
             self.last_raw_obs.get('Yaw', 0.0)
         )
         front_edge = edge_sensors[0]
-
+        look_ahead_severity = self._get_look_ahead_danger(
+            self.last_raw_obs, 
+            self.last_raw_obs.get('Yaw', 0.0), 
+            distance=6
+        )
         if abs_rel < math.pi / 4:
             # Reduce speed reward when front edge is detected
-            speed_scale = 0.2 if front_edge else 1.0
+            speed_scale = max(0.0, 1.0 - look_ahead_severity)
             reward += speed * speed_scale
 
             # Also penalize for moving fast toward an edge
             if front_edge and speed > 0.3:
-                reward -= speed * 1.5   # stronger than the speed reward above
+                reward -= speed  * look_ahead_severity * 5.0   # stronger than the speed reward above
+
+            if look_ahead_severity > 0.5 and speed < 0.1:
+                reward += 2.0 # Good job not driving off.
 
             if self.prev_dist is not None:
                 delta = self.prev_dist - dist
@@ -385,8 +422,62 @@ class MalmoBoatEnv(gym.Env):
             if self.current_target_checkpoint_idx >= self.num_check_points:
                 reward += 100.0
                 print("Lap complete!")
+        # 1. Get the current yaw (normalized to -180 to 180)
+        current_yaw = (obs.get('Yaw', 0.0) + 180) % 360 - 180
+
+        # 2. Calculate the target yaw from spawn/current pos to checkpoint
+        # dz is longitudinal (North/South), dx is lateral (East/West)
+        target_rad = math.atan2(dx_t, dz_t)
+        target_yaw = -math.degrees(target_rad)
+
+        # 3. Calculate the degrees off-target
+        # If this is 0.0, you are staring perfectly at the checkpoint.
+        # If this is positive, the checkpoint is to your LEFT.
+        # If this is negative, the checkpoint is to your RIGHT.
+        error_deg = (target_yaw - current_yaw + 180) % 360 - 180
+
+        # --- PRINT MONITOR ---
+        if self.steps % 10 == 0:
+            print(f"DEBUG | Boat Yaw: {current_yaw:6.1f}° | Target: {target_yaw:6.1f}° | ERROR: {error_deg:6.1f}°")
 
         return reward
+
+    def _get_look_ahead_danger(self, raw, yaw, distance=5):
+        """
+        Checks if there is lava/edge anywhere from 1 to 'distance' blocks ahead.
+        Returns a float: 0.0 (safe) to 1.0 (danger detected).
+        """
+        grid = raw.get('nearby_blocks', [])
+        if len(grid) < 147: return 0.0
+
+        ICE = {'packed_ice', 'ice', 'minecraft:packed_ice'}
+        
+        # Map yaw to world direction unit vectors
+        # MC: 0=S(+Z), 90=W(-X), 180=N(-Z), 270=E(+X)
+        yaw_rad = math.radians(yaw)
+        # We calculate the vector the boat is facing
+        dir_x = -math.sin(yaw_rad)
+        dir_z = math.cos(yaw_rad)
+
+        # Check multiple points along the line ahead
+        for d in range(1, distance + 1):
+            # Calculate grid coordinates for distance 'd'
+            check_x = int(round(dir_x * d))
+            check_z = int(round(dir_z * d))
+            
+            # Grid indexing (from your _get_edge_sensors logic)
+            ix = check_x + 3
+            iz = check_z + 3
+            
+            # Ensure we are within the 7x7 grid bounds (-3 to +3)
+            if 0 <= ix < 7 and 0 <= iz < 7:
+                idx = 0 * 49 + iz * 7 + ix # iy=0 is floor
+                if grid[idx] not in ICE:
+                    # Return a value based on how close the danger is
+                    # (Closer danger = higher value)
+                    return (distance - d + 1) / distance
+                    
+        return 0.0
 
     def _get_edge_sensors(self, raw, yaw):
         """

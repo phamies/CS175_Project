@@ -41,8 +41,8 @@
             </ObservationFromNearbyEntities>
             <ObservationFromGrid>
                 <Grid name="nearby_blocks">
-                    <min x="-3" y="-1" z="-3"/>
-                    <max x="3" y="1" z="3"/>
+                    <min x="-8" y="-1" z="-8"/>
+                    <max x="8" y="1" z="8"/>
                 </Grid>
             </ObservationFromGrid>
             <HumanLevelCommands/>
