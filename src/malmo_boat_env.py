@@ -287,6 +287,7 @@ class MalmoBoatEnv(gym.Env):
         # 0: None, 1: Left, 2: Right
 
         steering_idx = int(action[1])
+        throttle_idx = int(action[0])
 
         obs   = self.last_raw_obs
         x     = obs.get('XPos', 0)
@@ -320,11 +321,19 @@ class MalmoBoatEnv(gym.Env):
         abs_rel  = abs(rel)
 
         reward = 0.0
+        if (throttle_idx != 0):
+            reward += 0.25 # Living should be expensive, we don't want the machine to just be idling away.
 
         # --- Stage 1: alignment reward with dwell time bonus ---
-        # Base alignment: smooth 0..1 signal, always positive.
-        alignment = (math.pi - abs_rel) / math.pi   # 0..1
-        reward += alignment * 1.0
+        # Base alignment: smooth 0..1 signal, always positive. Based on speed constraints as well.
+        if speed > 0.05:
+            alignment = (math.pi - abs_rel) / math.pi   # 0..1
+            reward += alignment * speed * 5.0
+        # # 3. Progress Reward (The most important part)
+        #     if self.prev_dist is not None:
+        #         delta = self.prev_dist - dist
+        #         if delta > 0:
+        #             reward += delta * 20.0 # Huge reward for actually getting closer
 
         # Dwell time: track consecutive steps spent well-aligned (<30 deg).
         # Each step holding alignment earns a growing bonus — this directly
@@ -332,13 +341,15 @@ class MalmoBoatEnv(gym.Env):
         # rather than constantly overcorrecting.
         # When near an edge and the track curves, the agent learns to stop
         # and hold alignment rather than charging blindly forward.
-        ALIGNED_THRESHOLD = math.radians(30)   # within 30 deg = "aligned"
+        ALIGNED_THRESHOLD = math.radians(30)   # within 30 deg = "aligned" and must be moving at least a little.
         if abs_rel < ALIGNED_THRESHOLD:
             self.aligned_steps += 1
             # Bonus grows with dwell time, capped at 10 steps worth
             # so it doesn't completely dominate the reward at long holds
             dwell_bonus = min(self.aligned_steps, 10) * 0.15
             reward += dwell_bonus
+            if self.aligned_steps > 20 and speed < 0.1: # Don't stay too long in one place, you'll be rewarded as long as you are moving forward.
+                reward -= 20 * 0.15
         else:
             # Reset counter — broke alignment
             self.aligned_steps = 0
@@ -353,30 +364,31 @@ class MalmoBoatEnv(gym.Env):
         # self.prev_abs_rel = abs_rel
 
         # rel > 0 means target is to the RIGHT.
-        # rel < 0 means target is to the LEFT.
+        # rel < 0 means target is to the LEFT. 
+        if throttle_idx != 0 and speed > 0.1: # Throttle must be on to move anyways, we're just remediating this in our rewards function.
+            if rel > math.radians(20) and steering_idx == 2:
+                reward += 1.5  # Correcting toward the right
+            elif rel < math.radians(-20) and steering_idx == 1:
+                reward += 1.5  # Correcting toward the left
 
-        if rel > math.radians(20) and steering_idx == 2:
-            reward += 1.5  # Correcting toward the right
-        elif rel < math.radians(-20) and steering_idx == 1:
-            reward += 1.5  # Correcting toward the left
-
-        if self.prev_abs_rel is not None:
+        if self.prev_abs_rel is not None and throttle_idx != 0:
             # If abs_rel is increasing, we are spinning AWAY from target
             # If abs_rel is decreasing, we are rotating TOWARD target
             rotation_direction = self.prev_abs_rel - abs_rel
             if abs_rel < math.radians(15):
-                if steering_idx == 0:
+                if steering_idx == 0 and rotation_direction != 0:
                     reward += 1.0 # Reward "hands off the wheel" when straight
                 else:
                     # Check if this steering is helpful or harmful
                     # If we are rotating TOWARD the center (rotation_direction > 0)
                     # but we are still steering, that's oversteering.
                     if rotation_direction > 0:
-                        reward -= 2.0 # STOP STEERING, you're already headed home!
-                    else:
+                        reward -= 1.0 # STOP STEERING, you're already headed home!
+                    elif rotation_direction < 0:
                         # This is a COUNTER-STEER. 
                         # We are rotating away, so steering is necessary.
-                        reward += 1.5
+                        reward += 2.0
+        
         # --- Stage 2: forward progress only when aligned ---
         # Distance shaping and speed reward only fire when facing within 45 deg.
         # Agent must earn the right to go fast by aligning first.
@@ -403,9 +415,6 @@ class MalmoBoatEnv(gym.Env):
             # Also penalize for moving fast toward an edge
             if front_edge and speed > 0.3:
                 reward -= speed  * look_ahead_severity * 5.0   # stronger than the speed reward above
-
-            if look_ahead_severity > 0.5 and speed < 0.1:
-                reward += 2.0 # Good job not driving off.
 
             if self.prev_dist is not None:
                 delta = self.prev_dist - dist
@@ -438,7 +447,10 @@ class MalmoBoatEnv(gym.Env):
 
         # --- PRINT MONITOR ---
         if self.steps % 10 == 0:
-            print(f"DEBUG | Boat Yaw: {current_yaw:6.1f}° | Target: {target_yaw:6.1f}° | ERROR: {error_deg:6.1f}°")
+            t_msg = self.THROTTLE_MAP.get(throttle_idx, "stop")
+            s_msg = self.STEERING_MAP.get(steering_idx, "none")
+            print(f"STEP: {self.steps} | ACTION: [{t_msg}, {s_msg}]")
+            print(f"DEBUG | Boat Yaw: {current_yaw:6.1f}° | Target: {target_yaw:6.1f}° | ERROR: {error_deg:6.1f}° | Print: Reward: {reward:.4f}")
 
         return reward
 

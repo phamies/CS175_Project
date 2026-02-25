@@ -6,17 +6,18 @@ from datetime import datetime
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.logger import configure
 
 from malmo_boat_env import MalmoBoatEnv
-
-RUN_NAME = datetime.now().strftime("ppo_%Y%m%d_%H%M%S")
-
+RUN_NAME = "28KCopy"
+# RUN_NAME = datetime.now().strftime("ppo_%Y%m%d_%H%M%S")
+# "ppo_%Y%m%d_%H%M%S"
 SAVE_DIR = os.path.join("./models/", RUN_NAME)
 LOG_DIR  = os.path.join("./tensorboard_logs/", RUN_NAME)
-TOTAL_TIMESTEPS = 30_000
+TOTAL_TIMESTEPS = 45_000
 CHECKPOINT_FREQ = 2_500
 # Set this to the path of your .zip file to resume. Set to None to start fresh.
-LOAD_PATH = os.path.join("./models/ppo_20260224_023855\ppo_boat_interrupted.zip")
+LOAD_PATH = os.path.join("./models/28KCopy/ppo_boat_interrupted.zip")
 
 
 def _shutdown(signum, frame):
@@ -99,7 +100,8 @@ def main():
         print(f"Resuming training from: {LOAD_PATH}")
         _model = PPO.load(LOAD_PATH, env=_env)
         # Ensure the logger points to your new run directory
-        _model.set_logger(None) 
+        new_logger = configure(LOG_DIR, ["stdout", "tensorboard"])
+        _model.set_logger(new_logger)
     else:
         print("Building fresh PPO model...")
         _model = PPO(env=_env, **PPO_CONFIG)
