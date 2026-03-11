@@ -1,92 +1,27 @@
-"""
-train_boat_ppo.py
-
-PPO instead of DQN — better suited for ice boat physics because:
-  - On-policy rollouts keep full action sequences together, so PPO sees
-    "I turned -> slid -> overcorrected -> fell" as one coherent trajectory.
-    DQN's replay buffer shuffles these steps apart and loses that context.
-  - Ice boats have high momentum and delayed consequences. PPO's value
-    function can learn "this turn will cost me in 5 steps" whereas DQN
-    only bootstraps one step at a time.
-  - Continuous-feeling control (steering while sliding) maps better to
-    PPO's stochastic policy than DQN's epsilon-greedy discrete jumps.
-
-Usage:
-    python train_boat_ppo.py
-"""
-
 import os
 import signal
 import time
 from datetime import datetime
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
+from stable_baselines3.common.logger import configure
 
 from malmo_boat_env import MalmoBoatEnv
+from logging_callback import BoatLoggingCallback
 
+# RUN_NAME = "ppo_20260225_161200"   # uncomment to resume a specific run
 RUN_NAME = datetime.now().strftime("ppo_%Y%m%d_%H%M%S")
+RUN_NAME = "ppo_20260310_174753"
 
 SAVE_DIR = os.path.join("./models/", RUN_NAME)
 LOG_DIR  = os.path.join("./tensorboard_logs/", RUN_NAME)
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-
-ENV_CONFIG = {
-    "mission_xml_path":  "boat_mission.xml",
-    "millisec_per_tick": 20,
-    "num_tracks":        5,
-}
-
-PPO_CONFIG = dict(
-    policy      = "MlpPolicy",
-    verbose     = 1,
-
-    # Learning rate — PPO is less sensitive than DQN, 3e-4 is a reliable default
-    learning_rate = 3e-4,
-
-    # n_steps: steps collected per env before each update.
-    # Larger = more context per update = better for momentum-heavy environments.
-    # 2048 is standard. With slow Malmo this means ~2048 real steps before
-    # any learning — patient but stable.
-    n_steps = 2048,
-
-    # batch_size: minibatch size within each update epoch.
-    # Must divide n_steps evenly. 64 is standard.
-    batch_size = 64,
-
-    # n_epochs: how many times to reuse each rollout batch.
-    # Higher = more sample efficiency but risks overfitting old data.
-    n_epochs = 10,
-
-    # gamma: discount factor. 0.99 values future rewards highly.
-    # Good for a task where the goal (completing the track) is far away.
-    gamma = 0.99,
-
-    # gae_lambda: smoothing for advantage estimation.
-    # 0.95 balances bias vs variance — standard PPO default.
-    gae_lambda = 0.95,
-
-    # ent_coef: entropy bonus encourages exploration.
-    # 0.01 is a gentle push. Raise to 0.05 if agent stops exploring early.
-    ent_coef = 0.01,
-
-    # clip_range: how much the policy can change per update.
-    # 0.2 is the standard PPO clip.
-    clip_range = 0.2,
-
-    tensorboard_log = LOG_DIR,
-)
-
-TOTAL_TIMESTEPS = 30_000
+TOTAL_TIMESTEPS = 200_000
 CHECKPOINT_FREQ = 2_500
 
-# -----------------------------------------------------------------------------
-# Graceful shutdown
-# -----------------------------------------------------------------------------
-
+# LOAD_PATH = os.path.join("./models/ppo_20260225_161200/ppo_boat_interrupted.zip")
+LOAD_PATH = os.path.join("./models/ppo_20260310_174753\ppo_boat_interrupted.zip")
 _env   = None
 _model = None
 
@@ -108,41 +43,64 @@ def _shutdown(signum, frame):
 signal.signal(signal.SIGINT,  _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+ENV_CONFIG = {
+    "mission_xml_path":  "boat_mission.xml",
+    "millisec_per_tick": 20,
+    "num_tracks":        5,
+}
+
+PPO_CONFIG = dict(
+    policy        = "MlpPolicy",
+    verbose       = 1,
+    learning_rate = 3e-4,
+    n_steps       = 2048,
+    batch_size    = 64,
+    n_epochs      = 10,
+    gamma         = 0.99,
+    gae_lambda    = 0.95,
+    ent_coef      = 0.01,
+    clip_range    = 0.2,
+    tensorboard_log = LOG_DIR,
+)
+
 
 def main():
     global _env, _model
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    print("Waiting 8s for Malmo server to be ready...")
-    time.sleep(8)
-
     print("Initializing environment...")
-    _env = MalmoBoatEnv(
-        mission_xml_path  = ENV_CONFIG["mission_xml_path"],
-        millisec_per_tick = ENV_CONFIG["millisec_per_tick"],
-        num_tracks        = ENV_CONFIG["num_tracks"],
-    )
+    _env = MalmoBoatEnv(**ENV_CONFIG)
 
-    print("Building PPO model...")
-    _model = PPO(env=_env, **PPO_CONFIG)
+    if LOAD_PATH and os.path.exists(LOAD_PATH):
+        print(f"Resuming from: {LOAD_PATH}")
+        _model = PPO.load(LOAD_PATH, env=_env)
+        new_logger = configure(LOG_DIR, ["stdout", "tensorboard"])
+        _model.set_logger(new_logger)
+    else:
+        print("Building fresh PPO model...")
+        _model = PPO(env=_env, **PPO_CONFIG)
 
-    print(f"Tensorboard: tensorboard --logdir ./tensorboard_logs/")
-    print(f"Starting PPO training for {TOTAL_TIMESTEPS:,} timesteps...")
-    print(f"Note: first update happens after {PPO_CONFIG['n_steps']:,} steps -- be patient.")
-
-    _model.learn(
-        total_timesteps = TOTAL_TIMESTEPS,
-        callback        = CheckpointCallback(
+    log_path = os.path.join(SAVE_DIR, "training_log.csv")
+    callbacks = CallbackList([
+        CheckpointCallback(
             save_freq   = CHECKPOINT_FREQ,
             save_path   = SAVE_DIR,
             name_prefix = "ppo_boat",
             verbose     = 1,
         ),
-        tb_log_name = "ppo_boat",
+        BoatLoggingCallback(log_path=log_path, verbose=1),
+    ])
+
+    print(f"Logging to: {log_path}")
+    print(f"Tensorboard: tensorboard --logdir ./tensorboard_logs/")
+    print(f"Starting PPO training for {TOTAL_TIMESTEPS:,} timesteps...")
+
+    _model.learn(
+        total_timesteps     = TOTAL_TIMESTEPS,
+        reset_num_timesteps = False if (LOAD_PATH and os.path.exists(LOAD_PATH)) else True,
+        callback            = callbacks,
+        tb_log_name         = "ppo_boat",
     )
 
     path = os.path.join(SAVE_DIR, "ppo_boat_final")

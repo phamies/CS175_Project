@@ -54,13 +54,6 @@
                     <command>setPitch</command>
                 </ModifierList>
             </AbsoluteMovementCommands>
-            <!-- <RewardForMissionEnd>
-                <Reward description="out_of_time" reward="-500"/>
-            </RewardForMissionEnd> -->
-            <!-- <RewardForTouchingBlockType>
-                <Block reward="-1000" type="lava"          behaviour="onceOnly"/>
-                <Block reward="-1000" type="flowing_lava"  behaviour="onceOnly"/> -->
-            <!-- </RewardForTouchingBlockType> -->
             <MissionQuitCommands quitDescription="game_quit"/>
             <AgentQuitFromReachingCommandQuota total="0"/>
         </AgentHandlers>

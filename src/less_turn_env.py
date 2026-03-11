@@ -223,11 +223,7 @@ class MalmoBoatEnv(gym.Env):
         for key in ["forward", "back", "left", "right"]:
             self.agent_host.sendCommand(f"{key} 0")
         time.sleep(TICK_LENGTH * 10)
-        dx = tx - spawn_x
-        dz = tz - spawn_z
-        # atan2(dx, dz) gives the angle. In MC, we usually need to 
-        # negate degrees to match the 0-360 / -180-180 mapping correctly.
-        target_yaw = -math.degrees(math.atan2(dx, dz))
+        
         self.agent_host.sendCommand(f"tp {spawn_x} 230 {spawn_z}")
         time.sleep(TICK_LENGTH * 20)
 

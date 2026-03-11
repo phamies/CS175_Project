@@ -1,34 +1,25 @@
-"""
-
-Usage:
-    python train_boat.py
-"""
-
 import os
 import signal
 import time
+from datetime import datetime
 
 from stable_baselines3 import DQN
-from stable_baselines3.common.callbacks import CheckpointCallback
-from datetime import datetime
-from malmo_boat_env import MalmoBoatEnv
+from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 
+from malmo_boat_env import MalmoBoatEnv
+from logging_callback import BoatLoggingCallback
 
 RUN_NAME = datetime.now().strftime("dqn_%Y%m%d_%H%M%S")
 
-BASE_SAVE_DIR = "./models/"
-BASE_LOG_DIR  = "./tensorboard_logs/"
+SAVE_DIR = os.path.join("./models/", RUN_NAME)
+LOG_DIR  = os.path.join("./tensorboard_logs/", RUN_NAME)
 
-SAVE_DIR = os.path.join(BASE_SAVE_DIR, RUN_NAME)
-LOG_DIR  = os.path.join(BASE_LOG_DIR, RUN_NAME)
-
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+TOTAL_TIMESTEPS = 10_000
+CHECKPOINT_FREQ = 2_000
 
 ENV_CONFIG = {
     "mission_xml_path":  "boat_mission.xml",
-    "millisec_per_tick": 20,    # 20 = 2.5x faster than normal Minecraft
+    "millisec_per_tick": 20,
     "num_tracks":        5,
 }
 
@@ -45,14 +36,6 @@ DQN_CONFIG = dict(
     verbose                = 1,
     tensorboard_log        = LOG_DIR,
 )
-
-TOTAL_TIMESTEPS = 10_000
-CHECKPOINT_FREQ = 2_000
-
-# -----------------------------------------------------------------------------
-# Graceful shutdown — saves model and waits for Malmo to reach DORMANT
-# so the next script run doesn't collide with leftover server state
-# -----------------------------------------------------------------------------
 
 _env   = None
 _model = None
@@ -75,49 +58,40 @@ def _shutdown(signum, frame):
 signal.signal(signal.SIGINT,  _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
 
-# -----------------------------------------------------------------------------
-# Env factory — same pattern as maze create_env(config)
-# -----------------------------------------------------------------------------
-
-def create_env(config):
-    return MalmoBoatEnv(
-        mission_xml_path  = config["mission_xml_path"],
-        millisec_per_tick = config["millisec_per_tick"],
-        num_tracks        = config["num_tracks"],
-    )
-
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
 
 def main():
     global _env, _model
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    # Give Malmo time to clear after any previous run — same issue the
-    # maze example avoids by always letting episodes finish cleanly
     print("Waiting 8s for Malmo server to be ready...")
     time.sleep(8)
 
     print("Initializing environment...")
-    _env = create_env(ENV_CONFIG)
+    _env = MalmoBoatEnv(**ENV_CONFIG)
 
     print("Building DQN model...")
     _model = DQN(env=_env, **DQN_CONFIG)
 
-    print(f"Tensorboard: tensorboard --logdir ./tensorboard_logs/")
-    print(f"Starting DQN training for {TOTAL_TIMESTEPS:,} timesteps...")
-
-    _model.learn(
-        total_timesteps = TOTAL_TIMESTEPS,
-        callback        = CheckpointCallback(
+    log_path = os.path.join(SAVE_DIR, "training_log.csv")
+    callbacks = CallbackList([
+        CheckpointCallback(
             save_freq   = CHECKPOINT_FREQ,
             save_path   = SAVE_DIR,
             name_prefix = "dqn_boat",
             verbose     = 1,
         ),
-        tb_log_name = "dqn_boat",
+        BoatLoggingCallback(log_path=log_path, verbose=1),
+    ])
+
+    print(f"Logging to: {log_path}")
+    print(f"Tensorboard: tensorboard --logdir ./tensorboard_logs/")
+    print(f"Starting DQN training for {TOTAL_TIMESTEPS:,} timesteps...")
+
+    _model.learn(
+        total_timesteps = TOTAL_TIMESTEPS,
+        callback        = callbacks,
+        tb_log_name     = "dqn_boat",
     )
 
     path = os.path.join(SAVE_DIR, "dqn_boat_final")
