@@ -200,6 +200,8 @@ class MalmoBoatEnv(gym.Env):
         self.aligned_steps    = 0
         self.steps_since_checkpoint = 0
         self.prev_yaw = 0
+        self.prev_x = None
+        self.prev_z = None
 
     def _tp_spawn_and_boat(self):
         spawn_x, spawn_z = self.spawn_point
@@ -274,7 +276,7 @@ class MalmoBoatEnv(gym.Env):
             print("Timeout -- no checkpoint reached in 200 steps")
             return True
         return False
-
+    
     def _compute_reward(self, action):
         if self.last_raw_obs is None:
             return 0.0
@@ -372,7 +374,37 @@ class MalmoBoatEnv(gym.Env):
         self.prev_dist = dist
 
         # --- Checkpoint bonus ---
-        if dist < self.checkpoint_threshold:
+        # Check using both current AND previous position to catch high-speed passes
+        def dist_to_checkpoint(cx, cz):
+            return math.sqrt((cx - x)**2 + (cz - z)**2)
+
+        def passed_through(cx, cz):
+            """True if the line from prev_pos to cur_pos passed within threshold of checkpoint."""
+            if self.prev_x is None:
+                return False
+            # Vector from prev to current position
+            pdx = x - self.prev_x
+            pdz = z - self.prev_z
+            # Vector from prev to checkpoint
+            cdx = cx - self.prev_x
+            cdz = cz - self.prev_z
+            seg_len_sq = pdx**2 + pdz**2
+            if seg_len_sq < 1e-6:
+                return False
+            t = max(0.0, min(1.0, (cdx*pdx + cdz*pdz) / seg_len_sq))
+            closest_x = self.prev_x + t * pdx
+            closest_z = self.prev_z + t * pdz
+            return math.sqrt((cx - closest_x)**2 + (cz - closest_z)**2) < self.checkpoint_threshold
+
+        def check_checkpoint(idx, bonus):
+            if idx >= len(self.checkpoints):
+                return False
+            cx, cz = self.checkpoints[idx]
+            if dist_to_checkpoint(cx, cz) < self.checkpoint_threshold or passed_through(cx, cz):
+                return True
+            return False
+
+        if check_checkpoint(self.current_target_checkpoint_idx, 100.0):
             reward += 100.0
             self.steps_since_checkpoint = 0
             self.prev_dist = None
@@ -382,22 +414,16 @@ class MalmoBoatEnv(gym.Env):
             if self.current_target_checkpoint_idx >= self.num_check_points:
                 reward += 200.0
                 print("Lap complete!")
-        else:
-            # Check if agent skipped current checkpoint and hit the next one
-            next_idx = self.current_target_checkpoint_idx + 1
-            if next_idx < len(self.checkpoints):
-                nx, nz = self.checkpoints[next_idx]
-                next_dist = math.sqrt((nx - x)**2 + (nz - z)**2)
-                if next_dist < self.checkpoint_threshold:
-                    print(f"Skipped checkpoint {self.current_target_checkpoint_idx}, hit {next_idx}!")
-                    reward += 60.0  # partial credit for skipping
-                    self.steps_since_checkpoint = 0
-                    self.prev_dist = None
-                    self.current_target_checkpoint_idx = next_idx + 1
-                    self.aligned_steps = 0
-                    if self.current_target_checkpoint_idx >= self.num_check_points:
-                        reward += 200.0
-                        print("Lap complete!")
+        elif check_checkpoint(self.current_target_checkpoint_idx + 1, 60.0):
+            reward += 60.0
+            self.steps_since_checkpoint = 0
+            self.prev_dist = None
+            self.current_target_checkpoint_idx += 2
+            self.aligned_steps = 0
+            print(f"Skipped to checkpoint {self.current_target_checkpoint_idx}!")
+            if self.current_target_checkpoint_idx >= self.num_check_points:
+                reward += 200.0
+                print("Lap complete!")
 
         # --- PRINT MONITOR ---
         if self.steps % 10 == 0:
@@ -409,6 +435,8 @@ class MalmoBoatEnv(gym.Env):
             print(f"STEP: {self.steps} | ACTION: {a_msg}")
             print(f"DEBUG | Boat Yaw: {current_yaw:6.1f}° | Target: {target_yaw:6.1f}° | ERROR: {error_deg:6.1f}° | Reward: {reward:.4f}")
 
+        self.prev_x = x
+        self.prev_z = z
         return reward
 
     def _get_look_ahead_danger(self, raw, yaw, distance=5):
